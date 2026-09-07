@@ -7,6 +7,7 @@ import math
 import re
 import statistics
 import urllib3
+import xml.etree.ElementTree as ET
 from datetime import date, timedelta, datetime, time
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -212,6 +213,46 @@ def build_coordinate_preview_map(lat: float, lon: float) -> folium.Map:
     ).add_to(m)
     return m
 
+def parse_kml_favorites(kml_bytes: bytes) -> List[Dict[str, object]]:
+    """Extract (name, lat, lon) placemarks from a KML file's bytes."""
+    favorites: List[Dict[str, object]] = []
+    try:
+        root = ET.fromstring(kml_bytes)
+    except ET.ParseError:
+        return favorites
+
+    for placemark in root.iter():
+        if not placemark.tag.endswith("Placemark"):
+            continue
+        name, lat, lon = None, None, None
+        for child in placemark.iter():
+            tag = child.tag.rsplit("}", 1)[-1]
+            if tag == "name" and child.text and name is None:
+                name = child.text.strip()
+            elif tag == "coordinates" and child.text:
+                parts = child.text.strip().split(",")
+                if len(parts) >= 2:
+                    try:
+                        lon, lat = float(parts[0]), float(parts[1])
+                    except ValueError:
+                        lat, lon = None, None
+        if lat is not None and lon is not None and -90.0 <= lat <= 90.0 and -180.0 <= lon <= 180.0:
+            favorites.append({"name": name or f"Location {len(favorites) + 1}", "lat": lat, "lon": lon})
+    return favorites
+
+
+def build_kml_favorites(favorites: List[Dict[str, object]]) -> bytes:
+    """Serialize favorite locations to a minimal KML document."""
+    kml = ET.Element("kml", {"xmlns": "http://www.opengis.net/kml/2.2"})
+    document = ET.SubElement(kml, "Document")
+    for fav in favorites:
+        placemark = ET.SubElement(document, "Placemark")
+        ET.SubElement(placemark, "name").text = str(fav.get("name", ""))
+        point = ET.SubElement(placemark, "Point")
+        ET.SubElement(point, "coordinates").text = f"{fav['lon']},{fav['lat']},0"
+    return ET.tostring(kml, encoding="utf-8", xml_declaration=True)
+
+
 def get_precip_sum(start_d, end_d, data_dict):
     total = 0.0
     cur_d = start_d
@@ -292,6 +333,8 @@ if "detected_utc_offset" not in st.session_state: st.session_state.detected_utc_
 if "utc_offset_source" not in st.session_state: st.session_state.utc_offset_source = "default"
 if "utc_offset_user_edited" not in st.session_state: st.session_state.utc_offset_user_edited = False
 if "last_autodetected_offset" not in st.session_state: st.session_state.last_autodetected_offset = None
+if "favorite_locations" not in st.session_state: st.session_state.favorite_locations = []
+if "kml_last_imported_signature" not in st.session_state: st.session_state.kml_last_imported_signature = None
 
 
 def _mark_utc_offset_user_edited():
@@ -343,12 +386,13 @@ coord_mode = st.selectbox(
     ["decimal", "dms"],
     index=0,
     format_func=lambda mode: tr("Decimal Degrees", "Grados decimales", "Graus decimais") if mode == "decimal" else tr("GMS (Degrees Minutes Seconds)", "GMS (Grados Minutos Segundos)", "GMS (Graus Minutos Segundos)"),
+    key="coord_mode_select",
 )
 coord_col, map_col = st.columns([1, 1])
 with coord_col:
     if coord_mode == "decimal":
-        lat_input = st.text_input(tr("Latitude", "Latitud", "Latitude"), value="", placeholder="-26.9386111")
-        lon_input = st.text_input(tr("Longitude", "Longitud", "Longitude"), value="", placeholder="-52.39805555")
+        lat_input = st.text_input(tr("Latitude", "Latitud", "Latitude"), value="", placeholder="-26.9386111", key="lat_input")
+        lon_input = st.text_input(tr("Longitude", "Longitud", "Longitude"), value="", placeholder="-52.39805555", key="lon_input")
         lat_dms_input, lon_dms_input = "", ""
         st.caption(
             tr(
@@ -358,8 +402,8 @@ with coord_col:
             )
         )
     else:
-        lat_dms_input = st.text_input(tr("Latitude (GMS)", "Latitud (GMS)", "Latitude (GMS)"), value="", placeholder="26 56 19 S")
-        lon_dms_input = st.text_input(tr("Longitude (GMS)", "Longitud (GMS)", "Longitude (GMS)"), value="", placeholder="52 23 53 W")
+        lat_dms_input = st.text_input(tr("Latitude (GMS)", "Latitud (GMS)", "Latitude (GMS)"), value="", placeholder="26 56 19 S", key="lat_dms_input")
+        lon_dms_input = st.text_input(tr("Longitude (GMS)", "Longitud (GMS)", "Longitude (GMS)"), value="", placeholder="52 23 53 W", key="lon_dms_input")
         lat_input, lon_input = "", ""
         st.caption(
             tr(
@@ -405,6 +449,98 @@ if preview_lat is not None and preview_lon is not None:
         st.session_state.utc_offset_source = "coordinates"
     else:
         st.session_state.utc_offset_source = "default"
+
+with st.expander(tr("⭐ Favorite Locations (import/export .kml)", "⭐ Ubicaciones favoritas (importar/exportar .kml)", "⭐ Locais favoritos (importar/exportar .kml)")):
+    def _load_favorite_location():
+        fav = st.session_state.favorite_locations[st.session_state.favorite_location_select]
+        st.session_state.coord_mode_select = "decimal"
+        st.session_state.lat_input = str(fav["lat"])
+        st.session_state.lon_input = str(fav["lon"])
+
+    kml_file = st.file_uploader(
+        tr("Import locations from .kml", "Importar ubicaciones desde .kml", "Importar locais de .kml"),
+        type=["kml"],
+        key="kml_import_uploader",
+    )
+    if kml_file is not None:
+        file_signature = f"{kml_file.name}:{kml_file.size}"
+        if st.session_state.kml_last_imported_signature != file_signature:
+            st.session_state.kml_last_imported_signature = file_signature
+            imported = parse_kml_favorites(kml_file.getvalue())
+            existing = {
+                (f["name"], round(f["lat"], 6), round(f["lon"], 6)) for f in st.session_state.favorite_locations
+            }
+            added = 0
+            for fav in imported:
+                sig = (fav["name"], round(fav["lat"], 6), round(fav["lon"], 6))
+                if sig not in existing:
+                    st.session_state.favorite_locations.append(fav)
+                    existing.add(sig)
+                    added += 1
+            if added:
+                st.success(
+                    tr(f"Imported {added} location(s) from KML.", f"Se importaron {added} ubicación(es) del KML.", f"Importado(s) {added} local(is) do KML.")
+                )
+            else:
+                st.warning(
+                    tr(
+                        "No new valid placemarks found in this KML file.",
+                        "No se encontraron placemarks nuevos y válidos en este archivo KML.",
+                        "Nenhum placemark novo e válido encontrado neste arquivo KML.",
+                    )
+                )
+
+    if st.session_state.favorite_locations:
+        load_col, dl_col = st.columns([3, 1])
+        with load_col:
+            st.selectbox(
+                tr("Load a favorite location", "Cargar ubicación favorita", "Carregar local favorito"),
+                options=list(range(len(st.session_state.favorite_locations))),
+                format_func=lambda idx: (
+                    f"{st.session_state.favorite_locations[idx]['name']} "
+                    f"({st.session_state.favorite_locations[idx]['lat']:.5f}, {st.session_state.favorite_locations[idx]['lon']:.5f})"
+                ),
+                key="favorite_location_select",
+            )
+            st.button(
+                tr("Load selected location", "Cargar ubicación seleccionada", "Carregar local selecionado"),
+                on_click=_load_favorite_location,
+            )
+        with dl_col:
+            st.write("")
+            st.write("")
+            st.download_button(
+                tr("⬇️ Export .kml", "⬇️ Exportar .kml", "⬇️ Exportar .kml"),
+                data=build_kml_favorites(st.session_state.favorite_locations),
+                file_name="favorite_locations.kml",
+                mime="application/vnd.google-earth.kml+xml",
+                use_container_width=True,
+            )
+    else:
+        st.caption(
+            tr("No favorite locations saved yet.", "Aún no hay ubicaciones favoritas guardadas.", "Nenhum local favorito salvo ainda.")
+        )
+
+    st.markdown("---")
+    name_col, save_col = st.columns([3, 1])
+    with name_col:
+        new_favorite_name = st.text_input(
+            tr("Name for the current location", "Nombre para la ubicación actual", "Nome para o local atual"),
+            value="",
+            key="new_favorite_name",
+            placeholder=tr("e.g., Farm North Field", "ej., Campo Norte", "ex., Talhão Norte"),
+        )
+    with save_col:
+        st.write("")
+        st.write("")
+        if st.button(
+            tr("⭐ Save current", "⭐ Guardar actual", "⭐ Salvar atual"),
+            use_container_width=True,
+            disabled=preview_lat is None or preview_lon is None,
+        ):
+            fav_name = new_favorite_name.strip() or f"Location {len(st.session_state.favorite_locations) + 1}"
+            st.session_state.favorite_locations.append({"name": fav_name, "lat": preview_lat, "lon": preview_lon})
+            st.rerun()
 
 # 2. Date Range
 st.subheader(tr("2. Date Range", "2. Rango de fechas", "2. Intervalo de datas"))

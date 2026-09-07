@@ -1,0 +1,49 @@
+name: INMET monthly refresh
+
+on:
+  schedule:
+    # Once a day, days 1-10 of every month (UTC). INMET usually publishes the
+    # current year's updated historical-data ZIP within the first ~10 days of
+    # the following month, so this window is checked daily until new data shows up.
+    - cron: "0 9 1-10 * *"
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+concurrency:
+  group: inmet-monthly-refresh
+  cancel-in-progress: false
+
+jobs:
+  refresh:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Download and convert INMET data
+        run: python scripts/download_inmet.py --output-dir INMET
+
+      - name: Rebuild INMET station manifest
+        run: python build_inmet_manifest.py --data-dir INMET --output inmet_manifest.json
+
+      - name: Commit and push changes
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add INMET/*.parquet INMET/source_hashes.json inmet_manifest.json
+          if git diff --cached --quiet; then
+            echo "No INMET data changes to commit."
+          else
+            git commit -m "chore: refresh INMET data"
+            git push
+          fi
